@@ -325,7 +325,7 @@ def detect_emphasis_llm(
         "spoken video. You pick a small number of moments where a quick zoom-in "
         "would punch up an important point."
     )
-    user_prompt = f"""Identify moments in this transcript where a quick zoom-in (1-3 seconds) would emphasize a meaningful point.
+    user_prompt = f"""Identify moments in this transcript where a zoom-in would emphasize a meaningful point. The zoom will be held until the end of the sentence the speaker is currently saying, so pick the moment the emphasis starts.
 
 Pick phrases that are:
 - A key insight, takeaway, or surprising claim
@@ -334,7 +334,6 @@ Pick phrases that are:
 
 Do NOT pick:
 - Generic intros, outros, pleasantries, or filler
-- Long sentences — each pick should be 1-3 seconds (~3-12 words)
 - Adjacent moments — leave at least {min_spacing_s:.0f} seconds between picks
 
 Return at most {soft_cap} picks for this {video_duration:.0f}s clip. Zero is fine if nothing stands out.
@@ -365,14 +364,29 @@ Transcript (one segment per line, with start time in seconds):
             continue
         if e <= s:
             continue
-        # Snap to the nearest word start / word end.
+        # Snap start to the nearest word start, then extend end to the end of
+        # the sentence the speaker is in — the first word at/after the LLM's end
+        # whose text ends in sentence-final punctuation. This keeps the zoom
+        # held until the thought finishes instead of popping out mid-phrase.
         if all_words:
             s_word = min(all_words, key=lambda w: abs(w[1] - s))
-            e_word = min(all_words, key=lambda w: abs(w[2] - e))
             s = s_word[1]
-            e = max(e_word[2], s + 0.6)
-        # Clamp length to 1–3.5s so a single LLM mistake can't hold the zoom forever.
-        e = min(e, s + 3.5)
+            sentence_end: float | None = None
+            for (txt, _ws, we) in all_words:
+                if we < e:
+                    continue
+                if txt.rstrip("\"'”’)]}").endswith((".", "!", "?")):
+                    sentence_end = we
+                    break
+            if sentence_end is not None:
+                e = sentence_end
+            else:
+                e_word = min(all_words, key=lambda w: abs(w[2] - e))
+                e = e_word[2]
+            e = max(e, s + 0.6)
+        # Cap absolute length so a runaway sentence (or LLM mistake) can't hold
+        # the zoom forever.
+        e = min(e, s + 8.0)
         if e - s < 0.6:
             continue
         picked.append((s, e, str(m.get("why") or m.get("phrase") or "")))
@@ -1183,6 +1197,8 @@ def composite_with_subs(
     fps: float,
     segments: list[Segment],
     zoom_per_frame: list[list[float]] | None = None,
+    intro_frames: int = 0,
+    outro_frames: int = 0,
 ) -> None:
     """Composite each frame's panels onto a target_w x target_h canvas, draw
     subtitles, and stream to ffmpeg as raw BGR24."""
@@ -1240,6 +1256,19 @@ def composite_with_subs(
             else:
                 chunk_end = max(flat[-1].end, s_end)
             wrapped.append((chunk_start, chunk_end, chunk, flat))
+
+    # Pre-compute swoosh axis once. We overlay the swoosh during the first
+    # `intro_frames` and last `outro_frames` of the composited output so the
+    # underlying video keeps playing while the animation passes over it.
+    swoosh_u_grid: np.ndarray | None = None
+    swoosh_u_max: float = 0.0
+    if intro_frames > 0 or outro_frames > 0:
+        angle = math.radians(_SWOOSH_ANGLE_DEG)
+        tan_a = math.tan(angle)
+        swoosh_u_max = target_w + target_h * tan_a
+        xs = np.arange(target_w, dtype=np.float32)
+        ys = np.arange(target_h, dtype=np.float32)
+        swoosh_u_grid = xs[None, :] + ys[:, None] * tan_a
 
     ff = subprocess.Popen(
         [
@@ -1357,6 +1386,25 @@ def composite_with_subs(
                         y += line_h
                     crop = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
+            if swoosh_u_grid is not None:
+                # Overlay the swoosh on top of the playing video. Intro covers
+                # the first `intro_frames` frames (curtain pulling off to reveal
+                # the live scene); outro covers the last `outro_frames` frames
+                # (curtain sweeping in over the live scene to end on dark).
+                if intro_frames > 0 and idx < intro_frames:
+                    p = idx / max(1, intro_frames - 1)
+                    crop = _render_swoosh_frame(
+                        swoosh_u_grid, swoosh_u_max, target_w, target_h,
+                        _ease_in_out_cubic(p), crop, "intro",
+                    )
+                elif outro_frames > 0 and idx >= n - outro_frames:
+                    k = idx - (n - outro_frames)
+                    p = k / max(1, outro_frames - 1)
+                    crop = _render_swoosh_frame(
+                        swoosh_u_grid, swoosh_u_max, target_w, target_h,
+                        _ease_in_out_cubic(p), crop, "outro",
+                    )
+
             ff.stdin.write(np.ascontiguousarray(crop).tobytes())
             idx += 1
     finally:
@@ -1365,6 +1413,74 @@ def composite_with_subs(
         rc = ff.wait()
     if rc != 0:
         sys.exit(f"ffmpeg crop encode failed with code {rc}")
+
+
+_SWOOSH_DARK_BGR: tuple[int, int, int] = (28, 14, 8)          # near-black, cool deep-navy tint
+_SWOOSH_STRIPES_BGR: list[tuple[tuple[int, int, int], float]] = [
+    ((230, 110, 30), 0.18),   # deep cobalt   (#1E6EE6)
+    ((248, 189, 56), 0.17),   # vivid sky     (#38BDF8)
+    ((253, 222, 150), 0.18),  # pale ice-blue (#96DEFD)
+]
+_SWOOSH_ANGLE_DEG = 18.0
+_SWOOSH_GAP_FRAC = 0.018
+
+
+def _ease_in_out_cubic(p: float) -> float:
+    if p < 0.5:
+        return 4 * p * p * p
+    return 1 - ((-2 * p + 2) ** 3) / 2
+
+
+def _render_swoosh_frame(
+    u_grid: np.ndarray, u_max: float, w: int, h: int,
+    p: float, ref_frame: np.ndarray, kind: str,
+) -> np.ndarray:
+    """Render one swoosh frame.
+
+    The wipe is parameterized along a tilted axis u = x + y*tan(angle). Stripes
+    sit centered on `u_wave`. Pixels past the wipe (in the direction of motion)
+    show `ref_frame` — for intro that's the revealed first frame, for outro the
+    not-yet-covered last frame. Pixels the wipe has passed show the dark color.
+    """
+    gap = _SWOOSH_GAP_FRAC * u_max
+    total_stripe_w = sum(f for _, f in _SWOOSH_STRIPES_BGR) * u_max + gap * (len(_SWOOSH_STRIPES_BGR) - 1)
+    half = total_stripe_w / 2.0
+    buffer = 0.06 * u_max
+
+    if kind == "intro":
+        # Wave moves from large u (right) to small u (left). Covered side (u <
+        # wave - half) shows dark; uncovered side shows ref_frame (the reveal).
+        start_u = u_max + half + buffer
+        end_u = -half - buffer
+    else:
+        # Outro: wave moves left → right, covering the frame with dark behind it.
+        start_u = -half - buffer
+        end_u = u_max + half + buffer
+    u_wave = start_u + (end_u - start_u) * p
+
+    result = ref_frame.copy()
+    covered_mask = u_grid < (u_wave - half)
+    result[covered_mask] = _SWOOSH_DARK_BGR
+
+    edge_soft = max(1.5, u_max * 0.003)
+    result_f = result.astype(np.float32)
+    cur_right = u_wave + half
+    for color, frac in _SWOOSH_STRIPES_BGR:
+        sw = frac * u_max
+        cur_left = cur_right - sw
+        d_right = cur_right - u_grid
+        d_left = u_grid - cur_left
+        alpha = np.minimum(
+            np.clip(d_right / edge_soft, 0.0, 1.0),
+            np.clip(d_left / edge_soft, 0.0, 1.0),
+        )
+        if alpha.max() > 0:
+            alpha = alpha[..., None]
+            color_arr = np.array(color, dtype=np.float32).reshape(1, 1, 3)
+            result_f = result_f * (1.0 - alpha) + color_arr * alpha
+        cur_right = cur_left - gap
+
+    return np.clip(result_f, 0, 255).astype(np.uint8)
 
 
 def compute_target(src_w: int, src_h: int, aspect: str) -> tuple[int, int, tuple[int, int]]:
@@ -1443,6 +1559,22 @@ def main() -> None:
     ap.add_argument(
         "--emphasis-zoom", type=float, default=1.15,
         help="peak zoom factor for emphasis punches (default 1.15 = +15%%)",
+    )
+    ap.add_argument(
+        "--intro", action=argparse.BooleanOptionalAction, default=True,
+        help="prepend a colored swoosh intro that reveals the first frame (default: on)",
+    )
+    ap.add_argument(
+        "--outro", action=argparse.BooleanOptionalAction, default=True,
+        help="append a colored swoosh outro that wipes to black (default: on)",
+    )
+    ap.add_argument(
+        "--intro-duration", type=float, default=1.1,
+        help="intro swoosh sweep length in seconds (default 1.1)",
+    )
+    ap.add_argument(
+        "--outro-duration", type=float, default=0.85,
+        help="outro swoosh sweep length in seconds (default 0.85)",
     )
     args = ap.parse_args()
 
@@ -1556,12 +1688,30 @@ def main() -> None:
                         total, fps, max_zoom=args.emphasis_zoom,
                     )
 
+        # The swoosh is baked on top of the playing video for the first
+        # `intro_frames` and last `outro_frames` of the composited stream, so
+        # the underlying scene keeps moving while the animation passes over it.
+        # We cap each bookend at ~25% of the total to leave most of the clip
+        # un-overlaid even on short videos.
+        intro_frames = 0
+        outro_frames = 0
+        cap_frames = max(1, total // 4)
+        if args.intro:
+            intro_frames = min(cap_frames, int(round(args.intro_duration * fps)))
+        if args.outro:
+            outro_frames = min(cap_frames, int(round(args.outro_duration * fps)))
+        if intro_frames > 0:
+            print(f"  intro swoosh: {intro_frames} frames ({intro_frames / fps:.2f}s)")
+        if outro_frames > 0:
+            print(f"  outro swoosh: {outro_frames} frames ({outro_frames / fps:.2f}s)")
+
         print("compositing + drawing subtitles…")
         cropped = tdp / "cropped.mp4"
         composite_with_subs(
             work_inp, cropped, panels_per_frame,
             target_w, target_h, src_w, src_h, fps, segments,
             zoom_per_frame=zoom_per_frame,
+            intro_frames=intro_frames, outro_frames=outro_frames,
         )
 
         print("muxing audio…")

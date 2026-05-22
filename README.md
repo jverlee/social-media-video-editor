@@ -40,6 +40,8 @@ Flags:
 - `--sample-every N` — face-detect every Nth frame (default 5)
 - `--smooth-seconds` — single-speaker smoothing window (default 1.5s)
 - `--min-dwell` — minimum seconds before cutting to a new speaker (default 1.5s)
+- `--no-intro` / `--no-outro` — disable the colored swoosh bookends
+- `--intro-duration` / `--outro-duration` — sweep length in seconds (default 1.1 / 0.85)
 
 ## Fixing caption errors
 
