@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,6 +116,428 @@ def transcribe(video: Path, model_name: str, initial_prompt: str | None = None) 
         if words:
             segs.append((float(s["start"]), float(s["end"]), words))
     return segs
+
+
+_CAPTION_HEADER_RE = re.compile(r"^\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]\s*$")
+
+
+def review_captions(segments: list[Segment]) -> list[Segment]:
+    """Open the transcript in $EDITOR so the user can confirm or edit it.
+
+    The file shows one segment per block with a `[start - end]` marker; the user
+    edits the text below each marker. On save, segments whose text is unchanged
+    keep whisper's per-word timings exactly; edited ones get their words spread
+    evenly across the segment's time range.
+    """
+    if not segments:
+        return segments
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    if not shutil.which(editor.split()[0]):
+        print(f"  $EDITOR ({editor!r}) not found — skipping caption review")
+        return segments
+
+    lines = [
+        "# Review captions. Edit text below each [start - end] marker, then save & quit.",
+        "# Lines starting with # are ignored. Blank a segment's text to drop it.",
+        "# Pass --no-review-captions to skip this step.",
+        "",
+    ]
+    for (s_start, s_end, words) in segments:
+        text = " ".join(w[0] for w in words)
+        lines.append(f"[{s_start:.2f} - {s_end:.2f}]")
+        lines.append(text)
+        lines.append("")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="captions-",
+    ) as tf:
+        tf.write("\n".join(lines))
+        path = tf.name
+
+    print(f"opening captions in {editor}…")
+    try:
+        # Use a shell so $EDITOR values like "code -w" or "subl -w" work.
+        subprocess.check_call(f'{editor} "{path}"', shell=True)
+    except subprocess.CalledProcessError as e:
+        os.unlink(path)
+        sys.exit(f"editor exited with error: {e}")
+
+    with open(path) as f:
+        edited = f.read()
+    os.unlink(path)
+    return _parse_reviewed_captions(edited, segments)
+
+
+def _parse_reviewed_captions(text: str, originals: list[Segment]) -> list[Segment]:
+    # Key by the printed time range so we can detect "user didn't touch this
+    # segment" and preserve the original per-word timings.
+    orig_by_range: dict[tuple[str, str], list[Word]] = {
+        (f"{s:.2f}", f"{e:.2f}"): words for (s, e, words) in originals
+    }
+    segs: list[Segment] = []
+    cur: tuple[str, str] | None = None
+    cur_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal cur, cur_lines
+        if cur is None:
+            return
+        s_start = float(cur[0])
+        s_end = float(cur[1])
+        body = " ".join(ln.strip() for ln in cur_lines).strip()
+        cur_lines = []
+        key = cur
+        cur = None
+        if not body:
+            return
+        toks = body.split()
+        if not toks:
+            return
+        orig_words = orig_by_range.get(key)
+        if orig_words is not None and body == " ".join(w[0] for w in orig_words):
+            segs.append((s_start, s_end, orig_words))
+            return
+        # Spread tokens evenly across the segment range.
+        span = (s_end - s_start) / len(toks) if s_end > s_start else 0.01
+        words: list[Word] = [
+            (tok, s_start + i * span, s_start + (i + 1) * span)
+            for i, tok in enumerate(toks)
+        ]
+        segs.append((s_start, s_end, words))
+
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        m = _CAPTION_HEADER_RE.match(ln.strip())
+        if m:
+            flush()
+            cur = (m.group(1), m.group(2))
+            continue
+        if cur is not None:
+            cur_lines.append(ln)
+    flush()
+    return segs
+
+
+def load_openrouter_key() -> str | None:
+    """Return the OpenRouter API key from $OPENROUTER_API_KEY or .openrouter."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key.strip() or None
+    for p in (Path.cwd() / ".openrouter", Path(__file__).resolve().parent / ".openrouter"):
+        if p.exists():
+            txt = p.read_text().strip()
+            if txt:
+                return txt
+    return None
+
+
+def _openrouter_chat(api_key: str, model: str, messages: list[dict], timeout: float = 60.0) -> str:
+    """POST to OpenRouter's chat-completions endpoint and return the message text.
+
+    Uses curl (not urllib) because Python framework builds on macOS often hit
+    SSL cert-verify errors behind MITM proxies — the same reason whisper model
+    downloads in this script also shell out to curl.
+    """
+    if not shutil.which("curl"):
+        raise RuntimeError("curl not found; install it or set up Python certs")
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+    })
+    proc = subprocess.run(
+        [
+            "curl", "-sS", "--fail-with-body",
+            "--max-time", str(int(timeout)),
+            "-X", "POST",
+            "-H", f"Authorization: Bearer {api_key}",
+            "-H", "Content-Type: application/json",
+            "-H", "HTTP-Referer: https://github.com/local/edit_for_social",
+            "-H", "X-Title: edit_for_social",
+            "--data-binary", "@-",
+            "https://openrouter.ai/api/v1/chat/completions",
+        ],
+        input=payload,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"OpenRouter request failed (curl rc={proc.returncode}): {proc.stdout[:400] or proc.stderr[:400]}")
+    try:
+        body = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"OpenRouter returned non-JSON: {proc.stdout[:400]}") from e
+    if "choices" not in body:
+        raise RuntimeError(f"OpenRouter error: {body}")
+    return body["choices"][0]["message"]["content"]
+
+
+def _segments_for_prompt(segments: list[Segment]) -> str:
+    """One line per segment: `[seconds] text`, suitable for an LLM prompt."""
+    lines = []
+    for (s_start, _s_end, words) in segments:
+        text = " ".join(w[0] for w in words)
+        lines.append(f"[{s_start:.2f}] {text}")
+    return "\n".join(lines)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Pull the first {...} JSON object out of an LLM response (handles fences/prose)."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Strip the code fence.
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def detect_emphasis_llm(
+    segments: list[Segment],
+    api_key: str,
+    model: str,
+    max_per_min: float,
+    min_spacing_s: float,
+    video_duration: float,
+) -> list[tuple[float, float, str]]:
+    """Ask an LLM via OpenRouter to pick emphasis moments worth a zoom punch.
+
+    Returns a list of (start_s, end_s, reason) snapped to word boundaries and
+    de-conflicted by min_spacing_s.
+    """
+    if not segments:
+        return []
+    transcript = _segments_for_prompt(segments)
+    minutes = max(0.5, video_duration / 60.0)
+    soft_cap = max(0, int(round(minutes * max_per_min)))
+    sys_prompt = (
+        "You are an expert short-form video editor reviewing a transcript of a "
+        "spoken video. You pick a small number of moments where a quick zoom-in "
+        "would punch up an important point."
+    )
+    user_prompt = f"""Identify moments in this transcript where a quick zoom-in (1-3 seconds) would emphasize a meaningful point.
+
+Pick phrases that are:
+- A key insight, takeaway, or surprising claim
+- An emphatic delivery — the speaker is clearly hitting a point
+- An important name, number, or product detail worth highlighting
+
+Do NOT pick:
+- Generic intros, outros, pleasantries, or filler
+- Long sentences — each pick should be 1-3 seconds (~3-12 words)
+- Adjacent moments — leave at least {min_spacing_s:.0f} seconds between picks
+
+Return at most {soft_cap} picks for this {video_duration:.0f}s clip. Zero is fine if nothing stands out.
+
+Return JSON only, no prose, in this exact shape:
+{{"moments": [{{"start": <seconds>, "end": <seconds>, "phrase": "<words>", "why": "<short reason>"}}]}}
+
+Transcript (one segment per line, with start time in seconds):
+{transcript}
+"""
+    raw = _openrouter_chat(api_key, model, [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_prompt},
+    ])
+    parsed = _extract_json_object(raw)
+    if not parsed or "moments" not in parsed:
+        print(f"  emphasis: LLM returned no usable JSON (got {raw[:160]!r})")
+        return []
+    moments_raw = parsed.get("moments") or []
+    # All words flattened — used for snapping to nearest word boundaries.
+    all_words = [w for (_, _, ws) in segments for w in ws]
+    picked: list[tuple[float, float, str]] = []
+    for m in moments_raw:
+        try:
+            s = float(m["start"])
+            e = float(m["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e <= s:
+            continue
+        # Snap to the nearest word start / word end.
+        if all_words:
+            s_word = min(all_words, key=lambda w: abs(w[1] - s))
+            e_word = min(all_words, key=lambda w: abs(w[2] - e))
+            s = s_word[1]
+            e = max(e_word[2], s + 0.6)
+        # Clamp length to 1–3.5s so a single LLM mistake can't hold the zoom forever.
+        e = min(e, s + 3.5)
+        if e - s < 0.6:
+            continue
+        picked.append((s, e, str(m.get("why") or m.get("phrase") or "")))
+    picked.sort(key=lambda m: m[0])
+    # Enforce min spacing: keep the earliest, drop anything that starts within
+    # min_spacing_s of the previous moment's end.
+    final: list[tuple[float, float, str]] = []
+    for mt in picked:
+        if final and mt[0] - final[-1][1] < min_spacing_s:
+            continue
+        final.append(mt)
+    if soft_cap and len(final) > soft_cap:
+        final = final[:soft_cap]
+    return final
+
+
+def _emphasis_envelope(n: int, ramp_f: int, max_zoom: float) -> np.ndarray:
+    """Cosine-eased zoom envelope over n frames, peaking at max_zoom."""
+    env = np.ones(n, dtype=np.float32)
+    for t in range(n):
+        if t < ramp_f:
+            u = 0.5 - 0.5 * math.cos(math.pi * t / ramp_f)
+        elif t > n - ramp_f - 1:
+            k = max(0, n - 1 - t)
+            u = 0.5 - 0.5 * math.cos(math.pi * k / ramp_f)
+        else:
+            u = 1.0
+        env[t] = 1.0 + (max_zoom - 1.0) * u
+    return env
+
+
+def build_zoom_per_panel(
+    moments: list[tuple[float, float, str]],
+    panel_tracks_per_frame: list[list[int]],
+    speaker_per_frame: np.ndarray,
+    total_frames: int,
+    fps: float,
+    max_zoom: float = 1.15,
+    ramp_s: float = 0.18,
+) -> list[list[float]] | None:
+    """For each emphasis moment, zoom only the panel that's showing the dominant
+    active speaker during that window. Returns a per-frame list of per-panel
+    zoom factors (parallel to panels_per_frame), or None if there's nothing to do.
+    """
+    if not moments or total_frames <= 0:
+        return None
+    zooms: list[list[float]] = [
+        [1.0] * len(panel_tracks_per_frame[i]) for i in range(total_frames)
+    ]
+    ramp_f = max(1, int(round(ramp_s * fps)))
+    for (s, e, _why) in moments:
+        sf = max(0, int(round(s * fps)))
+        ef = min(total_frames, int(round(e * fps)))
+        if ef <= sf:
+            continue
+        # Dominant active speaker (track index) during this window.
+        window = speaker_per_frame[sf:ef]
+        valid = window[window >= 0]
+        if len(valid) > 0:
+            vals, counts = np.unique(valid, return_counts=True)
+            dominant = int(vals[np.argmax(counts)])
+        else:
+            dominant = -1
+        env = _emphasis_envelope(ef - sf, ramp_f, max_zoom)
+        for k, i in enumerate(range(sf, ef)):
+            ptracks = panel_tracks_per_frame[i]
+            if not ptracks:
+                continue
+            # Find the panel showing the dominant speaker; if not visible (or
+            # unknown), fall back to panel 0 so we still get a punch effect.
+            target_p = 0
+            for pi, tr in enumerate(ptracks):
+                if tr == dominant and dominant >= 0:
+                    target_p = pi
+                    break
+            zooms[i][target_p] = max(zooms[i][target_p], float(env[k]))
+    return zooms
+
+
+def speech_bounds_from_segments(segments: list[Segment]) -> tuple[float, float] | None:
+    """First word start and last word end across all segments."""
+    words = [w for (_, _, ws) in segments for w in ws]
+    if not words:
+        return None
+    return words[0][1], words[-1][2]
+
+
+def speech_bounds_silencedetect(
+    video: Path, duration: float, noise_db: float = -30.0, min_silence: float = 0.3,
+) -> tuple[float, float] | None:
+    """Use ffmpeg's silencedetect to find where audio activity starts and ends.
+
+    Returns (first_speech_s, last_speech_s) or None if the file has no audio.
+    """
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats", "-i", str(video),
+            "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+            "-f", "null", "-",
+        ],
+        capture_output=True, text=True,
+    )
+    out = proc.stderr
+    if "Audio:" not in out:
+        return None
+    silences: list[tuple[float, float | None]] = []
+    cur_start: float | None = None
+    for line in out.splitlines():
+        m = re.search(r"silence_start:\s*(-?[\d.]+)", line)
+        if m:
+            cur_start = max(0.0, float(m.group(1)))
+            continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m and cur_start is not None:
+            silences.append((cur_start, float(m.group(1))))
+            cur_start = None
+    if cur_start is not None:
+        silences.append((cur_start, None))
+
+    first = 0.0
+    last = duration
+    if silences and silences[0][0] <= 0.1 and silences[0][1] is not None:
+        first = silences[0][1]
+    if silences and silences[-1][1] is None:
+        last = silences[-1][0]
+    if last <= first:
+        return None
+    return first, last
+
+
+def shift_segments(segments: list[Segment], offset: float, new_duration: float) -> list[Segment]:
+    """Subtract offset from all timestamps; drop anything outside [0, new_duration]."""
+    if offset <= 0:
+        return segments
+    out: list[Segment] = []
+    for (s_start, s_end, words) in segments:
+        new_words: list[Word] = []
+        for (t, ws, we) in words:
+            nws = ws - offset
+            nwe = we - offset
+            if nwe <= 0 or nws >= new_duration:
+                continue
+            new_words.append((t, max(0.0, nws), min(new_duration, nwe)))
+        if new_words:
+            out.append((
+                max(0.0, s_start - offset),
+                min(new_duration, s_end - offset),
+                new_words,
+            ))
+    return out
+
+
+def trim_source(inp: Path, out: Path, start: float, duration: float) -> None:
+    """Re-encode inp[start : start+duration] to out. Re-encoding keeps the cut
+    frame-accurate; stream-copy would snap to the previous keyframe."""
+    subprocess.check_call([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.3f}",
+        "-i", str(inp),
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(out),
+    ])
 
 
 def load_replacements(args, input_path: Path) -> list[tuple[str, str]]:
@@ -546,20 +971,30 @@ def build_layout(
     target_h: int,
     aspect: tuple[int, int],
     layout_mode: str,                 # "auto" | "single" | "stack"
-) -> tuple[list[list[Panel]], list[Track], str]:
-    """Return (panels_per_frame, tracks, description).
+) -> tuple[list[list[Panel]], list[list[int]], np.ndarray, list[Track], str]:
+    """Return (panels_per_frame, panel_tracks_per_frame, speaker_per_frame, tracks, description).
 
-    panels_per_frame[i] is the list of Panels to composite for output frame i.
-    In stack and single-speaker-static modes every entry is the same list.
+    - panels_per_frame[i] is the list of Panels to composite for output frame i.
+    - panel_tracks_per_frame[i][p] is the track index displayed in panel p, or
+      -1 if no track is associated (center-crop fallback).
+    - speaker_per_frame[i] is the dominant active-speaker track index for frame
+      i, or -1 if unknown.
     """
     aw, ah = aspect
+    nf = max(1, total_frames)
 
     if total_frames <= 0 or not faces:
         cw, ch = _fit_aspect(src_w, src_h, aw, ah)
         x0 = (src_w - cw) // 2
         y0 = (src_h - ch) // 2
         panel = Panel(x0, y0, cw, ch, 0, 0, target_w, target_h)
-        return ([[panel]] * max(1, total_frames), [], "center crop (no faces)")
+        return (
+            [[panel]] * nf,
+            [[-1]] * nf,
+            np.full(nf, -1, dtype=int),
+            [],
+            "center crop (no faces)",
+        )
 
     tracks = cluster_tracks(faces, src_w, src_h)
     if not tracks:
@@ -567,7 +1002,13 @@ def build_layout(
         x0 = (src_w - cw) // 2
         y0 = (src_h - ch) // 2
         panel = Panel(x0, y0, cw, ch, 0, 0, target_w, target_h)
-        return ([[panel]] * total_frames, [], "center crop (no tracks)")
+        return (
+            [[panel]] * total_frames,
+            [[-1]] * total_frames,
+            np.full(total_frames, -1, dtype=int),
+            [],
+            "center crop (no tracks)",
+        )
 
     border_track = attach_tile_boxes(tracks, borders, src_w, src_h)
     compute_track_framing(tracks, src_w, src_h, aspect)
@@ -588,12 +1029,24 @@ def build_layout(
         top_panel = _panel_for_track(top_t, target_w, half_h, src_w, src_h, 0, 0)
         bot_panel = _panel_for_track(bot_t, target_w, half_h, src_w, src_h, 0, half_h)
         panels = [top_panel, bot_panel]
+        # Both panels are shown every frame; map their track ids so the zoom
+        # builder can pick which one to enlarge during an emphasis moment.
+        panel_tracks = [speakers[0], speakers[1]]
+        active = compute_speaker_timeline(
+            tracks, border_track, total_frames, sample_every, fps, min_dwell_seconds
+        )
         desc = (
             f"stack: top track {speakers[0]} {top_panel.src_w}x{top_panel.src_h}, "
             f"bottom track {speakers[1]} {bot_panel.src_w}x{bot_panel.src_h}; "
             f"{len(tracks) - 2} other track(s) excluded"
         )
-        return ([panels] * total_frames, tracks, desc)
+        return (
+            [panels] * total_frames,
+            [panel_tracks] * total_frames,
+            active,
+            tracks,
+            desc,
+        )
 
     # Single-person OR explicit single layout with multiple tracks: cut between
     # them based on active speaker.
@@ -625,7 +1078,13 @@ def build_layout(
             [Panel(int(x[i]), int(y[i]), w, h, 0, 0, target_w, target_h)]
             for i in range(total_frames)
         ]
-        return (panels_per_frame, tracks, f"single follow, crop {w}x{h}")
+        return (
+            panels_per_frame,
+            [[0]] * total_frames,
+            np.zeros(total_frames, dtype=int),
+            tracks,
+            f"single follow, crop {w}x{h}",
+        )
 
     # Multi-track single-panel: pick active speaker per frame.
     active = compute_speaker_timeline(
@@ -636,7 +1095,14 @@ def build_layout(
                0, 0, target_w, target_h)]
         for a in active
     ]
-    return (panels_per_frame, tracks, f"single panel, cuts between {len(tracks)} tracks")
+    panel_tracks_per_frame = [[int(a)] for a in active]
+    return (
+        panels_per_frame,
+        panel_tracks_per_frame,
+        active,
+        tracks,
+        f"single panel, cuts between {len(tracks)} tracks",
+    )
 
 
 def _fit_aspect(src_w: int, src_h: int, aw: int, ah: int) -> tuple[int, int]:
@@ -690,6 +1156,22 @@ def wrap_words(
     return lines
 
 
+def _zoom_panel(p: Panel, zoom: float, src_w: int, src_h: int) -> Panel:
+    """Shrink a panel's source rect around its center by `zoom`, clamped to the
+    source frame. dst rect is unchanged, so the panel ends up enlarged."""
+    if zoom <= 1.0001:
+        return p
+    new_w = max(2, int(p.src_w / zoom))
+    new_h = max(2, int(p.src_h / zoom))
+    new_w -= new_w % 2
+    new_h -= new_h % 2
+    new_x = p.src_x + (p.src_w - new_w) // 2
+    new_y = p.src_y + (p.src_h - new_h) // 2
+    new_x = max(0, min(src_w - new_w, new_x))
+    new_y = max(0, min(src_h - new_h, new_y))
+    return Panel(new_x, new_y, new_w, new_h, p.dst_x, p.dst_y, p.dst_w, p.dst_h)
+
+
 def composite_with_subs(
     video_path: Path,
     out_path: Path,
@@ -700,6 +1182,7 @@ def composite_with_subs(
     src_h: int,
     fps: float,
     segments: list[Segment],
+    zoom_per_frame: list[list[float]] | None = None,
 ) -> None:
     """Composite each frame's panels onto a target_w x target_h canvas, draw
     subtitles, and stream to ffmpeg as raw BGR24."""
@@ -783,6 +1266,13 @@ def composite_with_subs(
                 break
             j = idx if idx < n else n - 1
             panels = panels_per_frame[j]
+            if zoom_per_frame is not None and j < len(zoom_per_frame):
+                zs = zoom_per_frame[j]
+                if any(z > 1.0001 for z in zs):
+                    panels = [
+                        _zoom_panel(p, zs[pi] if pi < len(zs) else 1.0, src_w, src_h)
+                        for pi, p in enumerate(panels)
+                    ]
             if len(panels) == 1 and panels[0].dst_x == 0 and panels[0].dst_y == 0 \
                     and panels[0].dst_w == target_w and panels[0].dst_h == target_h:
                 # Fast path for single full-canvas panel.
@@ -918,6 +1408,42 @@ def main() -> None:
         "--replacements-file", default=None,
         help="path to a file of 'old=new' lines. <input>.replacements.txt is auto-loaded if it exists.",
     )
+    ap.add_argument(
+        "--review-captions", action=argparse.BooleanOptionalAction, default=True,
+        help="open the transcript in $EDITOR (or $VISUAL) to confirm/edit before rendering (default: on)",
+    )
+    ap.add_argument(
+        "--trim-silence", action=argparse.BooleanOptionalAction, default=True,
+        help="trim leading/trailing silence so the cut starts/ends near the first/last spoken word (default: on)",
+    )
+    ap.add_argument(
+        "--lead-pad", type=float, default=0.15,
+        help="seconds of audio to keep before the first spoken word (default 0.15)",
+    )
+    ap.add_argument(
+        "--tail-pad", type=float, default=0.30,
+        help="seconds of audio to keep after the last spoken word (default 0.30)",
+    )
+    ap.add_argument(
+        "--emphasis", action=argparse.BooleanOptionalAction, default=True,
+        help="use an LLM to pick emphasis moments and add quick zoom-in punches (default: on if API key is configured)",
+    )
+    ap.add_argument(
+        "--emphasis-model", default="anthropic/claude-sonnet-4.5",
+        help="OpenRouter model id for emphasis picks (default anthropic/claude-sonnet-4.5)",
+    )
+    ap.add_argument(
+        "--emphasis-max-per-min", type=float, default=2.0,
+        help="soft cap on zoom punches per minute (default 2.0)",
+    )
+    ap.add_argument(
+        "--emphasis-min-spacing", type=float, default=8.0,
+        help="minimum seconds between zoom punches (default 8.0)",
+    )
+    ap.add_argument(
+        "--emphasis-zoom", type=float, default=1.15,
+        help="peak zoom factor for emphasis punches (default 1.15 = +15%%)",
+    )
     args = ap.parse_args()
 
     check_deps()
@@ -927,25 +1453,16 @@ def main() -> None:
     out = Path(args.output).expanduser().resolve() if args.output else inp.with_name(inp.stem + "_social.mp4")
 
     info = probe(inp)
-    src_w, src_h, fps = info["width"], info["height"], info["fps"]
+    src_w, src_h, fps, duration = info["width"], info["height"], info["fps"], info["duration"]
     target_w, target_h, aspect_wh = compute_target(src_w, src_h, args.aspect)
     print(f"source {src_w}x{src_h} @ {fps:.2f}fps  →  target {target_w}x{target_h} ({args.aspect})")
 
     with tempfile.TemporaryDirectory() as td:
         tdp = Path(td)
 
-        print(f"detecting faces (every {args.sample_every} frames)…")
-        faces, borders, total = detect_faces(inp, args.sample_every)
-        sampled = (total + args.sample_every - 1) // args.sample_every
-        print(f"  {len(faces)} face detections, {len(borders)} active-speaker borders across {sampled} sampled frames")
-
-        panels_per_frame, tracks, layout_desc = build_layout(
-            faces, borders, total, src_w, src_h, fps,
-            args.sample_every, args.smooth_seconds, args.min_dwell,
-            target_w, target_h, aspect_wh, args.layout,
-        )
-        print(f"  {len(tracks)} face tracks → layout: {layout_desc}")
-
+        # Transcribe first (when subs are on) so we can use word timestamps as
+        # the speech boundaries for trimming. Whisper sees the *original* audio
+        # — trimming would only confuse it.
         segments: list[Segment] = []
         if not args.no_subs:
             print(f"transcribing with whisper '{args.whisper_model}'…")
@@ -956,19 +1473,102 @@ def main() -> None:
                 print(f"  {len(segments)} subtitle segments ({len(replacements)} replacement(s) applied)")
             else:
                 print(f"  {len(segments)} subtitle segments")
+            if args.review_captions and sys.stdin.isatty():
+                segments = review_captions(segments)
+                print(f"  {len(segments)} subtitle segments after review")
+            elif args.review_captions:
+                print("  stdin is not a TTY — skipping caption review")
+
+        # Decide on a trim window. Prefer ffmpeg's silencedetect — whisper tends
+        # to stretch the first word's start back to the segment start (sometimes
+        # all the way to 0.0), so its word timings are unreliable for trimming.
+        # Fall back to whisper bounds only if silencedetect finds nothing.
+        work_inp = inp
+        if args.trim_silence and duration > 0:
+            bounds = speech_bounds_silencedetect(inp, duration)
+            if bounds is None and segments:
+                bounds = speech_bounds_from_segments(segments)
+            if bounds is not None:
+                first, last = bounds
+                trim_start = max(0.0, first - args.lead_pad)
+                trim_end = min(duration, last + args.tail_pad)
+                new_dur = trim_end - trim_start
+                lead_gap = trim_start
+                tail_gap = duration - trim_end
+                print(
+                    f"  speech bounds: {first:.2f}s – {last:.2f}s "
+                    f"(lead silence {lead_gap:.2f}s, tail silence {tail_gap:.2f}s)"
+                )
+                # Only bother trimming if we'd cut more than ~200ms from either end.
+                if new_dur > 0.5 and (lead_gap > 0.2 or tail_gap > 0.2):
+                    print(
+                        f"trimming silence: {trim_start:.2f}s – {trim_end:.2f}s "
+                        f"(was 0.00s – {duration:.2f}s)"
+                    )
+                    trimmed = tdp / "trimmed.mp4"
+                    trim_source(inp, trimmed, trim_start, new_dur)
+                    work_inp = trimmed
+                    segments = shift_segments(segments, trim_start, new_dur)
+                else:
+                    print("no significant leading/trailing silence to trim")
+            else:
+                print("could not detect speech boundaries; skipping silence trim")
+
+        print(f"detecting faces (every {args.sample_every} frames)…")
+        faces, borders, total = detect_faces(work_inp, args.sample_every)
+        sampled = (total + args.sample_every - 1) // args.sample_every
+        print(f"  {len(faces)} face detections, {len(borders)} active-speaker borders across {sampled} sampled frames")
+
+        panels_per_frame, panel_tracks_per_frame, speaker_per_frame, tracks, layout_desc = build_layout(
+            faces, borders, total, src_w, src_h, fps,
+            args.sample_every, args.smooth_seconds, args.min_dwell,
+            target_w, target_h, aspect_wh, args.layout,
+        )
+        print(f"  {len(tracks)} face tracks → layout: {layout_desc}")
+
+        zoom_per_frame: list[list[float]] | None = None
+        if args.emphasis and segments:
+            api_key = load_openrouter_key()
+            if not api_key:
+                print("  emphasis: no OpenRouter API key found ($OPENROUTER_API_KEY or .openrouter) — skipping")
+            else:
+                # `total` is the trimmed-file frame count and `segments` is in
+                # the trimmed timeline, so picks land on the right frames.
+                trimmed_duration = total / fps if fps > 0 else 0.0
+                print(f"  emphasis: asking {args.emphasis_model} for zoom moments…")
+                try:
+                    moments = detect_emphasis_llm(
+                        segments,
+                        api_key,
+                        args.emphasis_model,
+                        args.emphasis_max_per_min,
+                        args.emphasis_min_spacing,
+                        trimmed_duration,
+                    )
+                except RuntimeError as e:
+                    print(f"  emphasis: {e} — skipping")
+                    moments = []
+                for (s, e, why) in moments:
+                    print(f"    {s:6.2f}s – {e:6.2f}s  {why}")
+                if moments:
+                    zoom_per_frame = build_zoom_per_panel(
+                        moments, panel_tracks_per_frame, speaker_per_frame,
+                        total, fps, max_zoom=args.emphasis_zoom,
+                    )
 
         print("compositing + drawing subtitles…")
         cropped = tdp / "cropped.mp4"
         composite_with_subs(
-            inp, cropped, panels_per_frame,
+            work_inp, cropped, panels_per_frame,
             target_w, target_h, src_w, src_h, fps, segments,
+            zoom_per_frame=zoom_per_frame,
         )
 
         print("muxing audio…")
         subprocess.check_call([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
             "-i", str(cropped),
-            "-i", str(inp),
+            "-i", str(work_inp),
             "-map", "0:v:0", "-map", "1:a:0?",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "128k",
