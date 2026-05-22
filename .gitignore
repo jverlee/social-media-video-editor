@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Input/output videos and per-video overrides
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.replacements.txt
