@@ -8,3 +8,7 @@ __pycache__/
 *.mkv
 *.webm
 *.replacements.txt
+
+# Secrets
+.openrouter
+.env
